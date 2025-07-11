@@ -169,6 +169,7 @@ const (
 	logWarnTimerLevelDiff       = time.Duration(30 * time.Minute)
 	historySizeLogThreshold     = 10 * 1024 * 1024
 	minContextTimeout           = 1 * time.Second
+	activeClusterLookupTimeout  = 1 * time.Second
 )
 
 func (s *contextImpl) GetShardID() int {
@@ -1308,7 +1309,11 @@ func (s *contextImpl) allocateTimerIDsLocked(
 
 			// if domain is active-active, lookup the workflow to determine the corresponding cluster
 			if domainEntry.GetReplicationConfig().IsActiveActive() {
-				lookupRes, err := s.GetActiveClusterManager().LookupWorkflow(context.Background(), task.GetDomainID(), task.GetWorkflowID(), task.GetRunID())
+				// TODO(active-active): create a contextImpl.ctx which is tied to the shard context lifecycle
+				// and use it here instead of creating a background context
+				ctx, cancel := context.WithTimeout(context.Background(), activeClusterLookupTimeout)
+				lookupRes, err := s.GetActiveClusterManager().LookupWorkflow(ctx, task.GetDomainID(), task.GetWorkflowID(), task.GetRunID())
+				cancel()
 				if err != nil {
 					return err
 				}
@@ -1435,7 +1440,7 @@ func (s *contextImpl) AddingPendingFailoverMarker(
 		return err
 	}
 	// domain is active, the marker is expired
-	isActive, _ := domainEntry.IsActiveIn(s.GetClusterMetadata().GetCurrentClusterName())
+	isActive := domainEntry.IsActiveIn(s.GetClusterMetadata().GetCurrentClusterName())
 	if isActive || domainEntry.GetFailoverVersion() > marker.GetFailoverVersion() {
 		s.logger.Info("Skipped out-of-date failover marker", tag.WorkflowDomainName(domainEntry.GetInfo().Name))
 		return nil
@@ -1451,36 +1456,46 @@ func (s *contextImpl) AddingPendingFailoverMarker(
 func (s *contextImpl) ValidateAndUpdateFailoverMarkers() ([]*types.FailoverMarkerAttributes, error) {
 
 	completedFailoverMarkers := make(map[*types.FailoverMarkerAttributes]struct{})
+	var pendingMarkers []*types.FailoverMarkerAttributes
+
 	s.RLock()
+	// Get a copy of pending markers while holding read lock
+	pendingMarkers = make([]*types.FailoverMarkerAttributes, len(s.shardInfo.PendingFailoverMarkers))
+	copy(pendingMarkers, s.shardInfo.PendingFailoverMarkers)
+
 	for _, marker := range s.shardInfo.PendingFailoverMarkers {
 		domainEntry, err := s.GetDomainCache().GetDomainByID(marker.GetDomainID())
 		if err != nil {
 			s.RUnlock()
 			return nil, err
 		}
-		isActive, _ := domainEntry.IsActiveIn(s.GetClusterMetadata().GetCurrentClusterName())
+		isActive := domainEntry.IsActiveIn(s.GetClusterMetadata().GetCurrentClusterName())
 		if isActive || domainEntry.GetFailoverVersion() > marker.GetFailoverVersion() {
 			completedFailoverMarkers[marker] = struct{}{}
 		}
 	}
+	s.RUnlock()
 
 	if len(completedFailoverMarkers) == 0 {
-		s.RUnlock()
-		return s.shardInfo.PendingFailoverMarkers, nil
+		// No markers to clean up, return the copy
+		return pendingMarkers, nil
 	}
-	s.RUnlock()
 
 	// clean up all pending failover tasks
 	s.Lock()
 	defer s.Unlock()
 
-	for idx, marker := range s.shardInfo.PendingFailoverMarkers {
-		if _, ok := completedFailoverMarkers[marker]; ok {
-			s.shardInfo.PendingFailoverMarkers[idx] = s.shardInfo.PendingFailoverMarkers[len(s.shardInfo.PendingFailoverMarkers)-1]
-			s.shardInfo.PendingFailoverMarkers[len(s.shardInfo.PendingFailoverMarkers)-1] = nil
-			s.shardInfo.PendingFailoverMarkers = s.shardInfo.PendingFailoverMarkers[:len(s.shardInfo.PendingFailoverMarkers)-1]
+	// Re-read the current state since it might have changed
+	currentPendingMarkers := s.shardInfo.PendingFailoverMarkers
+	remainingMarkers := make([]*types.FailoverMarkerAttributes, 0, len(currentPendingMarkers))
+
+	for _, marker := range currentPendingMarkers {
+		if _, ok := completedFailoverMarkers[marker]; !ok {
+			remainingMarkers = append(remainingMarkers, marker)
 		}
 	}
+
+	s.shardInfo.PendingFailoverMarkers = remainingMarkers
 	if err := s.updateShardInfoLocked(); err != nil {
 		return nil, err
 	}

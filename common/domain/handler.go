@@ -258,6 +258,11 @@ func (d *handlerImpl) RegisterDomain(
 		return err
 	}
 
+	if activeClusters != nil {
+		// active-active domain, activeClusterName is not used
+		activeClusterName = ""
+	}
+
 	replicationConfig := &persistence.DomainReplicationConfig{
 		ActiveClusterName: activeClusterName,
 		Clusters:          clusters,
@@ -283,7 +288,8 @@ func (d *handlerImpl) RegisterDomain(
 	}
 
 	failoverVersion := constants.EmptyVersion
-	if registerRequest.GetIsGlobalDomain() {
+	if registerRequest.GetIsGlobalDomain() && !replicationConfig.IsActiveActive() {
+		// assign failover version for active-passive domain
 		failoverVersion = d.clusterMetadata.GetNextFailoverVersion(activeClusterName, 0, registerRequest.Name)
 	}
 

@@ -39,7 +39,6 @@ import (
 	"github.com/uber/cadence/common/cluster"
 	"github.com/uber/cadence/common/constants"
 	"github.com/uber/cadence/common/definition"
-	"github.com/uber/cadence/common/errors"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/metrics"
@@ -248,6 +247,7 @@ func newMutableStateBuilder(
 		State:              persistence.WorkflowStateCreated,
 		CloseStatus:        persistence.WorkflowCloseStatusNone,
 		LastProcessedEvent: constants.EmptyEventID,
+		CronOverlapPolicy:  types.CronOverlapPolicySkipped,
 	}
 	s.hBuilder = NewHistoryBuilder(s)
 	s.taskGenerator = NewMutableStateTaskGenerator(shard.GetLogger(), shard.GetClusterMetadata(), shard.GetDomainCache(), s)
@@ -2056,8 +2056,7 @@ func (e *mutableStateBuilder) closeTransactionWithPolicyCheck(
 
 	if activeCluster != currentCluster {
 		e.logger.Debugf("closeTransactionWithPolicyCheck activeCluster != currentCluster, activeCluster=%v, currentCluster=%v, e.GetCurrentVersion()=%v", activeCluster, currentCluster, e.GetCurrentVersion())
-		domainID := e.GetExecutionInfo().DomainID
-		return errors.NewDomainNotActiveError(domainID, currentCluster, activeCluster)
+		return e.domainEntry.NewDomainNotActiveError(currentCluster, activeCluster)
 	}
 	return nil
 }
